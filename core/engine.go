@@ -295,6 +295,14 @@ type interactiveState struct {
 	pendingProviderAdd     *pendingProviderAddState
 	lastAutoCompressAt     time.Time
 	lastAutoCompressTokens int
+
+	// Lifecycle signals for the orphan-turn-reader goroutine that drains
+	// buffered events between user turns (Claude Code task-notification
+	// hook continuations, cron/relay auto-wake). orphanStop is closed to
+	// request stop; orphanDone is closed by the reader when it has
+	// exited. Both are nil when no reader is running. Accessed under mu.
+	orphanStop chan struct{}
+	orphanDone chan struct{}
 }
 
 type pendingProviderAddState struct {
@@ -2158,6 +2166,10 @@ func (e *Engine) processInteractiveMessageWith(p Platform, msg *Message, session
 		}
 	}()
 
+	// Stop any orphan-turn reader running between turns before we drain.
+	// Otherwise the reader and drainEvents would race on the same channel.
+	e.stopOrphanReader(state)
+
 	// Drain any stale events left in the channel from a previous turn.
 	// This prevents the next processInteractiveEvents from reading an old
 	// EventResult that was pushed after the previous turn already returned.
@@ -3202,6 +3214,22 @@ func (e *Engine) processInteractiveEvents(state *interactiveState, session *Sess
 				doneReaction = func() { doneTI.AddDoneReaction(replyCtx) }
 			}
 
+			// Spawn an orphan-turn reader so events emitted after this
+			// turn ends (Claude Code task-notification hook continuations,
+			// cron/relay auto-wake) are forwarded to the user instead of
+			// being silently drained by the next turn's drainEvents call.
+			if state.agentSession != nil && state.agentSession.Alive() {
+				state.mu.Lock()
+				if state.orphanStop == nil {
+					state.orphanStop = make(chan struct{})
+					state.orphanDone = make(chan struct{})
+					state.mu.Unlock()
+					go e.orphanTurnReader(state, sessionKey, session, sessions, p, replyCtx, workspaceDir)
+				} else {
+					state.mu.Unlock()
+				}
+			}
+
 			return
 
 		case EventError:
@@ -3314,6 +3342,8 @@ func (e *Engine) drainPendingMessages(state *interactiveState, session *Session,
 			return false
 		}
 
+		// Stop orphan reader spawned by the previous turn before draining.
+		e.stopOrphanReader(state)
 		drainEvents(state.agentSession.Events())
 
 		session.AddHistory("user", queued.content)
@@ -6437,6 +6467,8 @@ func (e *Engine) runCompress(state *interactiveState, session *Session, sessions
 	state.replyCtx = replyCtx
 	state.mu.Unlock()
 
+	// Stop orphan reader before draining, so they don't race on events.
+	e.stopOrphanReader(state)
 	drainEvents(state.agentSession.Events())
 
 	compressor, ok := e.agent.(ContextCompressor)
@@ -7501,6 +7533,146 @@ func (e *Engine) sendRaw(p Platform, replyCtx any, content string) {
 		return
 	}
 	_ = e.sendAlreadyRenderedWithError(p, replyCtx, content)
+}
+
+// orphanTurnReader drains events emitted by the agent session between
+// user turns (e.g. Claude Code task-notification hook continuations, cron
+// or relay auto-wake). Without it, EventResult events arriving while no
+// processInteractiveEvents loop is active would sit in the buffered
+// events channel and then be silently discarded by the next turn's
+// drainEvents call. The reader forwards each EventResult to the platform
+// using the reply context of the turn that spawned it and records the
+// response in session history. It exits when orphanStop is closed (at
+// the start of the next user turn or when compressing), when the engine
+// context is cancelled, or when the event channel closes.
+func (e *Engine) orphanTurnReader(
+	state *interactiveState,
+	sessionKey string,
+	session *Session,
+	sessions *SessionManager,
+	p Platform,
+	replyCtx any,
+	workspaceDir string,
+) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("orphan reader panicked", "session_key", sessionKey, "panic", r)
+		}
+		state.mu.Lock()
+		done := state.orphanDone
+		state.mu.Unlock()
+		if done != nil {
+			func() {
+				defer func() { _ = recover() }()
+				close(done)
+			}()
+		}
+	}()
+
+	if state.agentSession == nil {
+		return
+	}
+	events := state.agentSession.Events()
+
+	state.mu.Lock()
+	stop := state.orphanStop
+	state.mu.Unlock()
+	if stop == nil {
+		return
+	}
+
+	var textParts []string
+	var toolCount int
+
+	for {
+		select {
+		case <-stop:
+			return
+		case <-e.ctx.Done():
+			return
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			switch event.Type {
+			case EventText:
+				if event.Content != "" {
+					textParts = append(textParts, event.Content)
+				}
+			case EventToolUse:
+				toolCount++
+			case EventResult:
+				fullResponse := event.Content
+				if fullResponse == "" && len(textParts) > 0 {
+					fullResponse = strings.Join(textParts, "")
+				}
+				if fullResponse == "" {
+					fullResponse = e.i18n.T(MsgEmptyResponse)
+				}
+				cleanResponse := ctxSelfReportRe.ReplaceAllString(fullResponse, "")
+				cleanResponse = strings.TrimRight(cleanResponse, "\n ")
+				baseResponse := cleanResponse
+
+				if state.agentSession != nil {
+					if currentID := state.agentSession.CurrentSessionID(); currentID != "" {
+						if session.CompareAndSetAgentSessionID(currentID, e.agent.Name()) {
+							sessions.Save()
+						}
+					}
+				}
+
+				session.AddHistory("assistant", baseResponse)
+				sessions.Save()
+
+				e.hooks.Emit(HookEvent{
+					Event:      HookEventMessageSent,
+					SessionKey: sessionKey,
+					Platform:   p.Name(),
+					Content:    baseResponse,
+				})
+
+				slog.Info("orphan turn complete",
+					"session", session.ID,
+					"session_key", sessionKey,
+					"tools", toolCount,
+					"response_len", len(cleanResponse),
+				)
+
+				for _, chunk := range splitMessage(cleanResponse, maxPlatformMessageLen) {
+					if err := e.sendWithErrorForWorkspace(p, replyCtx, chunk, workspaceDir); err != nil {
+						slog.Warn("orphan reader: send failed", "session_key", sessionKey, "error", err)
+						break
+					}
+				}
+
+				textParts = nil
+				toolCount = 0
+			case EventError:
+				if event.Error != nil {
+					slog.Warn("orphan reader: agent error event", "session_key", sessionKey, "error", event.Error)
+				}
+			}
+		}
+	}
+}
+
+// stopOrphanReader stops any running orphan-turn reader and waits for it
+// to exit. Safe to call when none is running. Must NOT be called while
+// holding state.mu.
+func (e *Engine) stopOrphanReader(state *interactiveState) {
+	state.mu.Lock()
+	stop := state.orphanStop
+	done := state.orphanDone
+	state.orphanStop = nil
+	state.orphanDone = nil
+	state.mu.Unlock()
+	if stop == nil {
+		return
+	}
+	close(stop)
+	if done != nil {
+		<-done
+	}
 }
 
 // drainEvents discards any buffered events from the channel.
